@@ -1,6 +1,6 @@
 import { DownloadIcon, MailIcon, PinIcon } from "@/components/icons";
 import { Reveal } from "@/components/reveal";
-import { site, yearsOfExperience } from "@/content/site";
+import { site, stats, yearsOfExperience } from "@/content/site";
 
 export function Hero() {
   return (
@@ -11,7 +11,7 @@ export function Hero() {
             aria-hidden="true"
             className="h-1.5 w-1.5 rounded-full bg-emerald-500"
           />
-          Open to interesting problems
+          {site.availability}
         </p>
       </Reveal>
 
@@ -55,6 +55,24 @@ export function Hero() {
             {site.location}
           </span>
         </div>
+      </Reveal>
+
+      <Reveal delay={240}>
+        <dl className="mt-12 grid grid-cols-3 gap-4 border-t border-line pt-6">
+          {stats.map((stat) => (
+            <div key={stat.label}>
+              <dt className="sr-only">{stat.label}</dt>
+              <dd>
+                <span className="block text-xl font-semibold tracking-tight sm:text-2xl">
+                  {stat.value}
+                </span>
+                <span className="mt-1 block font-mono text-[11px] leading-snug text-subtle">
+                  {stat.label}
+                </span>
+              </dd>
+            </div>
+          ))}
+        </dl>
       </Reveal>
     </section>
   );

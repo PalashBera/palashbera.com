@@ -28,6 +28,8 @@ export function Experience() {
                   </p>
                 </div>
 
+                <p className="mt-1.5 text-sm text-subtle">{job.context}</p>
+
                 <ul className="mt-4 space-y-2.5">
                   {job.highlights.map((highlight) => (
                     <li

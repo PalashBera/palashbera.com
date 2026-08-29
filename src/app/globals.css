@@ -94,6 +94,52 @@
   }
 }
 
+/*
+ * Shiki runs at build time with two themes at once and, because defaultColor is
+ * off, writes each token's colour into --shiki-light / --shiki-dark rather than
+ * a literal colour. Picking one here means switching theme costs no JavaScript
+ * and no re-highlight.
+ *
+ * The .line wrappers carry no variable of their own, so their declaration is
+ * invalid at computed-value time and they simply inherit from .shiki.
+ */
+.shiki,
+.shiki span {
+  color: var(--shiki-light);
+  background-color: transparent;
+}
+
+.dark .shiki,
+.dark .shiki span {
+  color: var(--shiki-dark);
+}
+
+/* Shiki keeps real newlines, so `white-space: pre` handles line breaks and the
+   block scrolls horizontally instead of wrapping mid-token. */
+.shiki code {
+  display: block;
+  width: fit-content;
+  min-width: 100%;
+}
+
+/* Heading anchors: reveal a subtle # on hover without shifting the text. */
+.mdx :is(h2, h3) > a {
+  position: relative;
+}
+
+.mdx :is(h2, h3) > a::before {
+  content: "#";
+  position: absolute;
+  right: calc(100% + 0.4rem);
+  color: var(--accent);
+  opacity: 0;
+  transition: opacity 150ms;
+}
+
+.mdx :is(h2, h3) > a:hover::before {
+  opacity: 1;
+}
+
 /* Scroll-reveal. Gated on html.js so no-JS visitors see everything. */
 @media (prefers-reduced-motion: no-preference) {
   .js [data-reveal="false"] {

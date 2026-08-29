@@ -1,6 +1,6 @@
 import { Reveal } from "@/components/reveal";
 import { Section } from "@/components/section";
-import { education, site } from "@/content/site";
+import { education, focusAreas, site } from "@/content/site";
 
 export function About() {
   return (
@@ -27,6 +27,19 @@ export function About() {
           ))}
         </Reveal>
       </div>
+
+      <Reveal delay={140}>
+        <ul className="mt-10 grid gap-px overflow-hidden rounded-xl border border-line bg-line sm:grid-cols-3">
+          {focusAreas.map((area) => (
+            <li key={area.title} className="bg-surface p-5">
+              <h3 className="text-sm font-medium">{area.title}</h3>
+              <p className="mt-2 text-[13px] leading-relaxed text-muted">
+                {area.body}
+              </p>
+            </li>
+          ))}
+        </ul>
+      </Reveal>
     </Section>
   );
 }

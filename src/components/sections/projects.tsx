@@ -12,6 +12,12 @@ export function Projects() {
           <li key={project.name}>
             <Reveal delay={i * 60}>
               <article className="group rounded-xl border border-line bg-surface p-5 transition-colors hover:border-line-strong sm:p-6">
+                {project.context ? (
+                  <p className="mb-2 font-mono text-[11px] tracking-wide text-subtle uppercase">
+                    {project.context}
+                  </p>
+                ) : null}
+
                 <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
                   <h3 className="text-base font-medium">
                     {project.href ? (

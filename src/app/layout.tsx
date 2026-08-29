@@ -39,7 +39,12 @@ export const metadata: Metadata = {
     "AWS",
     site.location,
   ],
-  alternates: { canonical: "/" },
+  // Stops iOS Safari turning the phone number and address into grey auto-links.
+  formatDetection: { telephone: false, address: false, email: false },
+  alternates: {
+    canonical: "/",
+    types: { "application/rss+xml": `${site.url}/feed.xml` },
+  },
   openGraph: {
     type: "website",
     url: site.url,

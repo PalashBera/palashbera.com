@@ -37,7 +37,7 @@ const CHANNELS = [
 
 export function Contact() {
   return (
-    <Section id="contact" index="05" title="Contact">
+    <Section id="contact" index="06" title="Contact">
       <Reveal>
         <p className="max-w-xl text-[15px] leading-relaxed text-muted">
           I&apos;m always happy to talk about backend architecture, performance

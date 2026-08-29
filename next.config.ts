@@ -1,3 +1,4 @@
+import createMDX from "@next/mdx";
 import type { NextConfig } from "next";
 
 const isDev = process.env.NODE_ENV !== "production";
@@ -6,10 +7,10 @@ const isDev = process.env.NODE_ENV !== "production";
  * Baseline hardening headers.
  *
  * `script-src`/`style-src` allow 'unsafe-inline' because Next.js streams inline
- * hydration scripts and next/font emits inline styles; locking those down needs
- * a per-request nonce from middleware, which would opt the whole site out of
- * static rendering. Everything is still origin-locked, so no third-party script
- * or style host can be pulled in.
+ * hydration scripts, next/font emits inline styles, and Shiki emits per-token
+ * inline styles; locking those down needs a per-request nonce from middleware,
+ * which would opt the whole site out of static rendering. Everything is still
+ * origin-locked, so no third-party script or style host can be pulled in.
  *
  * Development additionally needs 'unsafe-eval' (React's dev build uses eval for
  * debugging features), websockets for hot reload, and no HTTPS upgrade so that
@@ -46,6 +47,7 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  pageExtensions: ["ts", "tsx", "mdx"],
   poweredByHeader: false,
   reactStrictMode: true,
   async headers() {
@@ -53,4 +55,32 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+/**
+ * Plugins are referenced by name rather than imported: Turbopack runs the MDX
+ * pipeline in Rust and can only receive serializable options, so a JS function
+ * passed here would fail to cross the boundary.
+ */
+const withMDX = createMDX({
+  options: {
+    remarkPlugins: ["remark-gfm"],
+    rehypePlugins: [
+      "rehype-slug",
+      ["rehype-autolink-headings", { behavior: "wrap" }],
+      [
+        "@shikijs/rehype",
+        {
+          // Both themes are emitted as CSS variables in a single build, so
+          // switching colour scheme costs no JavaScript and no re-highlight.
+          themes: { light: "github-light", dark: "github-dark-dimmed" },
+          defaultColor: false,
+          // Puts `language-*` on the <code>, which is how the code block header
+          // knows what to label itself.
+          addLanguageClass: true,
+          fallbackLanguage: "text",
+        },
+      ],
+    ],
+  },
+});
+
+export default withMDX(nextConfig);

@@ -1,0 +1,166 @@
+The demo worked and everyone hated it. You typed a question, the button showed a spinner, and eleven seconds later a paragraph appeared. The paragraph was good. The eleven seconds of nothing was the entire experience.
+
+We hadn't built anything slow. Generating that much text takes about eleven seconds, and no amount of optimisation changes that. What we'd built was a request/response interaction on top of a process that produces output incrementally, and thrown away the incremental part.
+
+## Streaming is a latency illusion and that's fine
+
+Time to first token was about 400ms. Time to last token was eleven seconds. If you show tokens as they arrive, the perceived wait is 400ms and the rest is reading time.
+
+Nothing is faster. The total is identical. But "waiting" becomes "reading", and those feel nothing alike — which is the whole reason every chat interface streams.
+
+## Server-sent events, not websockets
+
+My first instinct was ActionCable, because that's the Rails answer to "push data to the browser". It's the wrong tool here.
+
+Websockets are bidirectional and stateful. This is one-directional, one-shot, per-request text. Server-sent events are a plain HTTP response that stays open, which means they work with normal controllers, normal auth, normal middleware, and normal load balancers, and the browser reconnects on its own.
+
+The Rails side needs `ActionController::Live`:
+
+```ruby
+class CompletionsController < ApplicationController
+  include ActionController::Live
+
+  def create
+    response.headers["Content-Type"] = "text/event-stream"
+    response.headers["Cache-Control"] = "no-store"
+    # Stops nginx buffering the whole response before sending anything.
+    response.headers["X-Accel-Buffering"] = "no"
+
+    sse = SSE.new(response.stream, event: "token")
+
+    LlmClient.stream(prompt: params.require(:prompt)) do |chunk|
+      sse.write({ text: chunk })
+    end
+
+    sse.write({ done: true }, event: "done")
+  rescue ActionController::Live::ClientDisconnected
+    Rails.logger.info("client disconnected mid-stream")
+  ensure
+    sse&.close
+  end
+end
+```
+
+Three things in there are load-bearing and I got each of them wrong first.
+
+`X-Accel-Buffering: no` — without it nginx buffers the response and delivers the whole thing at once, which reproduces the exact problem you're solving, except now it's harder to debug because it works locally. Every reverse proxy has an equivalent.
+
+The `ensure` block. `ActionController::Live` runs the action in a separate thread and holds the connection. Miss the `close` and the thread leaks and the connection stays open, and you find out when Puma runs out of threads an hour later.
+
+`ClientDisconnected` is a normal event, not an error. Users close tabs mid-answer constantly. Unhandled, it fills your error tracker with noise until real errors are invisible in it.
+
+## The threading problem nobody mentions
+
+Here's the part that made me nervous about shipping this, and I think it's underdiscussed.
+
+**Every open stream holds a Puma thread for its full duration.** Eleven seconds per request, five threads per worker: five concurrent conversations saturates a container. Not five hundred — five.
+
+Regular requests are 200ms, so a thread serves five per second. A streaming request is 55× longer, so a container's effective capacity for these drops by the same factor. Sizing for this endpoint is a completely different calculation from the rest of the app, and if you put them behind the same pool the streams will starve everything else.
+
+What we did:
+
+- **A separate deployment for streaming endpoints.** Its own containers, its own thread count, its own scaling policy. Traffic split at the load balancer by path. This is the change that mattered most and it's an infrastructure decision, not a code one.
+- **Checked out the database connection early and released it before streaming.** `ActiveRecord::Base.connection_pool.release_connection` after loading what you need. Holding a database connection for eleven seconds while doing no database work is how a streaming endpoint exhausts the pool for the entire app.
+- **A hard timeout on the upstream call**, so a stalled provider doesn't hold a thread indefinitely.
+
+I'd also seriously evaluate Falcon or a Rack 3 streaming server if streaming is a core feature rather than one endpoint. Thread-per-connection is a poor fit for many long-lived connections, and that's a fibre-based server's whole reason for existing.
+
+## The React side
+
+`EventSource` is the obvious client, and it has one disqualifying limitation: it's `GET` only, with no custom headers. Prompts don't belong in a query string and auth tokens don't either. So `fetch` with a streamed body:
+
+```jsx
+export function useCompletion() {
+  const [text, setText] = useState("");
+  const [state, setState] = useState("idle");
+  const controller = useRef(null);
+
+  const send = useCallback(async (prompt) => {
+    controller.current?.abort();
+    controller.current = new AbortController();
+
+    setText("");
+    setState("streaming");
+
+    const response = await fetch("/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+      signal: controller.current.signal,
+    });
+
+    const reader = response.body
+      .pipeThrough(new TextDecoderStream())
+      .getReader();
+
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += value;
+
+      // SSE frames are separated by a blank line. A chunk can split one.
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+
+      for (const frame of frames) {
+        const data = frame.split("\n").find((l) => l.startsWith("data:"));
+        if (!data) continue;
+
+        const payload = JSON.parse(data.slice(5));
+        if (payload.text) setText((prev) => prev + payload.text);
+      }
+    }
+
+    setState("done");
+  }, []);
+
+  return { text, state, send, stop: () => controller.current?.abort() };
+}
+```
+
+The buffering is the bug everyone ships. A network chunk has no relationship to an SSE frame — you'll get half a frame, or three and a half. Parsing each chunk as if it were a complete message works in development and drops tokens in production, and it drops them more often on worse connections, so it looks like a provider problem.
+
+Keeping the remainder in `buffer` and only parsing complete `\n\n`-delimited frames is the entire fix. I've now written this wrong twice.
+
+`AbortController` on the ref does double duty: it's the stop button, and it cancels the previous stream when a new one starts so two responses can't interleave into the same state.
+
+## Rendering it without melting the browser
+
+`setText(prev => prev + chunk)` re-renders on every token. At 40 tokens a second, with markdown parsing and syntax highlighting downstream, that was 60% of a mid-range phone's main thread.
+
+The fix that worked was to decouple arrival from rendering — accumulate into a ref, flush to state on a frame:
+
+```jsx
+const pending = useRef("");
+
+// in the read loop
+pending.current += payload.text;
+
+// once, on a rAF loop while streaming
+useEffect(() => {
+  if (state !== "streaming") return;
+  let frame;
+
+  const flush = () => {
+    if (pending.current) {
+      setText((prev) => prev + pending.current);
+      pending.current = "";
+    }
+    frame = requestAnimationFrame(flush);
+  };
+
+  frame = requestAnimationFrame(flush);
+  return () => cancelAnimationFrame(frame);
+}, [state]);
+```
+
+Now renders are capped at the display refresh rate no matter how fast tokens arrive. Deferring the expensive markdown render until the stream completes — plain text while streaming, formatted after — bought the rest.
+
+## What generalises
+
+Very little of this was about LLMs. Swap in a slow report, a long export, a multi-step workflow, and every problem is the same: a long-running operation that produces output incrementally, and the cost of not exposing that.
+
+What was genuinely new to me was the capacity arithmetic. I'd internalised that requests are short, and every default in a Rails deployment assumes it — thread counts, connection pools, load balancer timeouts, autoscaling on CPU. An endpoint that holds a connection for eleven seconds violates that assumption quietly, and the failure isn't slowness on that endpoint. It's the rest of your app queueing behind it.

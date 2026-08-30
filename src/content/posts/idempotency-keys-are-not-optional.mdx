@@ -1,0 +1,136 @@
+Their integration timed out at 30 seconds. Ours completed the charge at 31. Their client retried, as any sensible client does, and we charged the card again.
+
+Nothing failed. No exception was raised anywhere in our system, no alert fired, and both requests were handled correctly according to every line of code we'd written. The customer was charged twice because a timeout is not an answer, and we'd built an API that assumed it was.
+
+## The gap a timeout leaves
+
+When an HTTP request times out, the client learns exactly one thing: it didn't get a response. That's all. The request may have never arrived, may have failed halfway, or may have completed perfectly with the response lost on the way back.
+
+From the caller's side those are indistinguishable, and only one of them is safe to retry.
+
+So the caller has a choice with no good option. Retry, and risk doing it twice. Don't retry, and risk it never happening. Every API that mutates something and doesn't offer idempotency is forcing its consumers to make that bet, dozens of times a day.
+
+The fix is to let the client name the operation, so a repeat is recognisable:
+
+```
+POST /v1/charges
+Idempotency-Key: 8f14e45f-ea01-4c2b-9e11-7b3c9d1a55e0
+```
+
+Same key means same operation. Do it once; on a repeat, return what happened the first time.
+
+## The naive version, which has a race in it
+
+```ruby
+def create
+  existing = IdempotentRequest.find_by(key: request.headers["Idempotency-Key"])
+  return render(json: existing.response_body, status: existing.status) if existing
+
+  charge = ChargeService.call(charge_params)
+  IdempotentRequest.create!(key: key, response_body: charge.to_json, status: 201)
+
+  render json: charge, status: :created
+end
+```
+
+This is the same read-modify-write race as any other check-then-act. Two retries arriving together both find nothing, both charge, both insert. Retries are *especially* prone to this because they arrive in bursts — a client with three retry attempts and a flaky connection can have two in flight at once.
+
+The database has to arbitrate, and the tool is a unique index plus the insert going *first*:
+
+```ruby
+class CreateIdempotentRequests < ActiveRecord::Migration[7.1]
+  def change
+    create_table :idempotent_requests do |t|
+      t.string :key, null: false
+      t.string :endpoint, null: false
+      t.string :request_digest, null: false
+      t.string :state, null: false, default: "in_progress"
+      t.integer :response_status
+      t.jsonb :response_body
+      t.timestamps
+    end
+
+    add_index :idempotent_requests, %i[key endpoint], unique: true
+  end
+end
+```
+
+```ruby
+class Idempotency
+  Conflict = Class.new(StandardError)
+  InProgress = Class.new(StandardError)
+
+  def self.run(key:, endpoint:, digest:)
+    record = IdempotentRequest.create!(
+      key: key, endpoint: endpoint, request_digest: digest
+    )
+
+    result = yield
+    record.update!(state: "complete", response_status: 201, response_body: result)
+    result
+  rescue ActiveRecord::RecordNotUnique
+    replay(key, endpoint, digest)
+  end
+
+  def self.replay(key, endpoint, digest)
+    record = IdempotentRequest.find_by!(key: key, endpoint: endpoint)
+
+    # Same key, different payload: the client has a bug. Don't guess.
+    raise Conflict if record.request_digest != digest
+
+    # First attempt is still running. Tell them to wait rather than duplicating.
+    raise InProgress if record.state == "in_progress"
+
+    record.response_body
+  end
+end
+```
+
+The insert is the lock. Whoever wins the unique index does the work; everyone else takes the `RecordNotUnique` path. No advisory lock, no Redis, no window.
+
+## Three details that took me a second pass
+
+**Store the request digest.** A client reusing a key with a *different* body is a bug on their side, and silently returning the old response hides it — they think they charged ₹500 and you're showing them a receipt for ₹200. Stripe returns a 400 for this and so should you. `Digest::SHA256.hexdigest(canonical_json(params))`, with sorted keys so formatting differences don't produce false conflicts.
+
+**`in_progress` is a real state.** The first attempt might still be running when the retry lands. You can't return a result and you mustn't start a second charge, so the honest answer is `409` with a `Retry-After`. Silently returning `null` here was a bug we shipped and it caused a *third* charge, from a client that treated the empty response as failure.
+
+**Scope the key to the endpoint.** A client generating one UUID per logical action might reasonably use it for a charge and a related refund. Uniqueness on `key` alone makes the second one a phantom replay of the first.
+
+## Expiry, which is a policy decision
+
+These rows can't live forever, and how long they live determines your guarantee.
+
+```ruby
+IdempotentRequest.where(created_at: ..24.hours.ago).delete_all
+```
+
+24 hours is what most payment APIs use. The reasoning is that it needs to outlive any plausible retry schedule — including a client whose exponential backoff runs for an hour, and a human who reruns a failed batch the next morning. Anything shorter and a legitimate retry becomes a duplicate charge; much longer and you're keeping response bodies you'll never read.
+
+Whatever you choose, document it. It's part of the contract, not an implementation detail.
+
+## The other half: retrying safely yourself
+
+The same reasoning applies outbound, and it's easier to get wrong because the failure is someone else's.
+
+```ruby
+class PaymentClient
+  def charge(order)
+    # Deterministic from the order — a retry of the same order reuses it.
+    key = "order-#{order.id}-charge-#{order.charge_attempt}"
+
+    post("/v1/charges", body: { amount: order.total_cents }, headers: {
+      "Idempotency-Key" => key
+    })
+  end
+end
+```
+
+Deriving the key from durable data rather than `SecureRandom` is what makes this work across process restarts. If your Sidekiq job generates a fresh UUID and then the container is killed, the retry produces a new key and the safety is gone. The key has to be a function of *what you're doing*, not of *when you tried*.
+
+And retry only what's safe. A `500` might mean the operation completed; a `422` means it definitively didn't. With an idempotency key you can retry both, which is precisely the point — the key converts "unknown outcome" from a dilemma into a normal case.
+
+## What I'd say to my earlier self
+
+I used to think idempotency was a payments concern. It isn't. It's a property you need on **any endpoint whose double execution is worse than its non-execution**, and once you phrase it that way the list gets long: sending an invitation, creating a support ticket, provisioning a resource, posting to a webhook, submitting a form on a mobile connection.
+
+The tell is a `POST` that creates something, called by anything you don't control — a mobile app, a partner integration, a background job with retries, a browser on a train. All of those retry. Most of them retry without asking you.

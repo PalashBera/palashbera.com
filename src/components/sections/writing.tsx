@@ -3,7 +3,7 @@ import { Reveal } from "@/components/reveal";
 import { Section } from "@/components/section";
 import { formatPostDate, publishedPosts } from "@/content/posts";
 
-const MAX_ON_HOME = 3;
+const MAX_ON_HOME = 5;
 
 export function Writing() {
   const posts = publishedPosts.slice(0, MAX_ON_HOME);

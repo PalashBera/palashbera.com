@@ -1,0 +1,84 @@
+Twelve seconds. That was the admin dashboard, and it was twelve seconds every single time, because nine tiles each ran a `COUNT` over a table with several million rows and no two of them counted the same thing.
+
+Active accounts this month. Orders pending review. Revenue by region. That sort of thing. Individually each query was defensible. Together they were a page nobody could bear to open, so people stopped opening it, and then nobody noticed when the numbers went wrong.
+
+## Attempt one: cache the page
+
+Obvious first move. Wrap each tile in `Rails.cache.fetch` with a five minute expiry.
+
+It worked, in the sense that eight of nine requests were fast. But the ninth — whoever arrived just after expiry — still paid twelve seconds, and now they paid it while holding a Puma thread that four other requests were queued behind.
+
+Worse, the dashboard was the only place these numbers existed, so "up to five minutes stale" turned into an argument with the operations team about whether the pending-review count could be trusted. Caching had converted a performance problem into a correctness conversation, which is a bad trade when the underlying query is the thing that's wrong.
+
+## Attempt two: counter caches
+
+Rails has `counter_cache` and it's genuinely great for `posts.comments_count`. It's an integer column, incremented in the same transaction as the write.
+
+It does not help here, and understanding why took me embarrassingly long. `counter_cache` maintains *one* number: the count of all children. Every tile on this dashboard was a **filtered** count.
+
+```ruby
+Order.where(status: "pending_review").count
+Order.where(status: "pending_review", region: "APAC").count
+Order.where("created_at > ?", 30.days.ago).count
+```
+
+You can't `counter_cache` your way to that. You'd need a column per filter combination, maintained on every state transition, and the third one moves on its own as time passes. I did briefly build two of these columns before admitting where it was heading.
+
+## What actually worked: a materialized view
+
+The realisation was that this page didn't need live data and didn't need arbitrary filters. It needed nine specific numbers, refreshed every few minutes. That's a materialized view — a real table on disk holding the result of a query, recomputed when you say so.
+
+```sql
+CREATE MATERIALIZED VIEW dashboard_metrics AS
+SELECT
+  1 AS id,
+  count(*) FILTER (WHERE status = 'pending_review')          AS pending_review,
+  count(*) FILTER (WHERE status = 'pending_review'
+                   AND region = 'APAC')                      AS pending_review_apac,
+  count(*) FILTER (WHERE created_at > now() - interval '30 days') AS recent_orders,
+  sum(total_cents) FILTER (WHERE status = 'complete')         AS revenue_cents
+FROM orders;
+
+-- Required for CONCURRENTLY. Without it the refresh takes an exclusive lock.
+CREATE UNIQUE INDEX dashboard_metrics_pkey ON dashboard_metrics (id);
+```
+
+Two things worth pulling out of that.
+
+`count(*) FILTER (WHERE ...)` computes every tile in **one** pass over the table. Nine separate `COUNT` queries meant nine scans; one query with nine filtered aggregates means one. That change alone took the cold computation from twelve seconds to about two.
+
+And the unique index is not optional. `REFRESH MATERIALIZED VIEW` takes an `ACCESS EXCLUSIVE` lock and blocks all reads for the duration. `REFRESH MATERIALIZED VIEW CONCURRENTLY` doesn't, but it requires a unique index to diff against. Miss that and you've built a scheduled two-second outage.
+
+```ruby
+class RefreshDashboardMetricsJob
+  include Sidekiq::Job
+
+  def perform
+    ActiveRecord::Base.connection.execute(
+      "REFRESH MATERIALIZED VIEW CONCURRENTLY dashboard_metrics"
+    )
+  end
+end
+```
+
+Reading it is a normal model:
+
+```ruby
+class DashboardMetric < ApplicationRecord
+  self.table_name = "dashboard_metrics"
+  def readonly? = true
+end
+```
+
+Dashboard load: 40ms, one indexed row fetch.
+
+## How I choose now
+
+The question I ask first is how fresh the number has to be, and I try to get an actual answer rather than "live", because "live" is what everyone says by default.
+
+- **Truly live, single number, cheap to maintain** — `counter_cache`. It's a column, it's transactional, it costs a write per insert.
+- **Live, filtered, and the filter set is small and known** — a partial index and a real query. `CREATE INDEX ... WHERE status = 'pending_review'` makes that count fast without any denormalisation.
+- **A few minutes stale is fine, several aggregates at once** — materialized view, refreshed on a schedule, `CONCURRENTLY`, unique index.
+- **Arbitrary slicing over history** — stop. That's an analytics workload and it doesn't belong on the primary database at all.
+
+The mistake I keep watching people make, and made twice here, is reaching for a cache when the query itself is the problem. A cache doesn't make a slow query faster. It makes it rarer, moves the cost onto an unlucky user, and adds a staleness argument you'll have later with someone who doesn't care about your Puma threads.

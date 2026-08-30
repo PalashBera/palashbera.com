@@ -1,0 +1,69 @@
+"Add `.includes(:comments)` here, this is an N+1" is the most common comment I leave on pull requests. It's also, once, the comment that made a page four times slower.
+
+The endpoint listed 500 posts and showed a comment count next to each one. Classic N+1: one query for posts, 500 more for counts. So we added the obvious fix.
+
+```ruby
+# before: 501 queries
+@posts = Post.order(created_at: :desc).limit(500)
+
+# after: 2 queries
+@posts = Post.includes(:comments).order(created_at: :desc).limit(500)
+```
+
+Query count dropped from 501 to 2. Response time went from 1.9s to 7.4s.
+
+## Why fewer queries was worse
+
+The 500 queries were each trivial — an indexed `COUNT` on `comments.post_id`, well under a millisecond. Postgres handled them fine. The cost was almost entirely Ruby: 500 round trips through ActiveRecord.
+
+The 2 queries loaded every comment on all 500 posts. About 60,000 rows, each one instantiated as an ActiveRecord object with a full attribute hash, so we could call `.size` on the collection and throw all of them away.
+
+Postgres was never the bottleneck. Object allocation was. I'd optimised the number I could see on the query log instead of the thing that was actually slow.
+
+The fix was to stop loading comments at all:
+
+```ruby
+@posts = Post.order(created_at: :desc).limit(500)
+@counts = Comment.where(post: @posts).group(:post_id).count
+```
+
+Two queries, no comment objects, 180ms. Later we added a `counter_cache` and it became one query.
+
+## The part that surprised me more
+
+`includes` doesn't have one behaviour, it has two, and it picks between them based on the rest of the query.
+
+Normally it *preloads*: a second query with `WHERE post_id IN (...)`, results stitched together in Ruby. But if you reference the joined table anywhere in `where` or `order`, Rails silently switches to `eager_load`, which is a single `LEFT OUTER JOIN`.
+
+```ruby
+# preload: SELECT * FROM posts; SELECT * FROM comments WHERE post_id IN (...)
+Post.includes(:comments).limit(500)
+
+# eager_load: one LEFT OUTER JOIN, because `where` touches comments
+Post.includes(:comments).where(comments: { flagged: true }).limit(500)
+```
+
+That distinction matters more than it looks. The join version returns one row per post-comment pair, and `LIMIT 500` applies to *joined rows*, not posts. So the second query doesn't return 500 posts. It returns however many posts fit in the first 500 pairs — sometimes 12.
+
+I have watched two engineers argue about a "Rails pagination bug" that was this, exactly this, for most of an afternoon.
+
+If you want the join, ask for it explicitly with `references`, and know that you're now paginating over a cartesian product. If you want two clean queries, use `preload`. I've mostly stopped writing `includes` in application code, because the two strategies have genuinely different performance characteristics and I'd rather say which one I meant:
+
+- `preload` — always two queries, never joins, safe with `limit`
+- `eager_load` — always one `LEFT OUTER JOIN`, filterable, breaks naive pagination
+- `joins` — `INNER JOIN` for filtering only, loads nothing, pair with `select` or a separate aggregate
+
+## What I actually check now
+
+When something is slow, the first question isn't "how many queries" — it's "how many objects".
+
+```ruby
+# in a console, around the suspicious code
+before = GC.stat[:total_allocated_objects]
+result = PostsController.render(:index)
+GC.stat[:total_allocated_objects] - before
+```
+
+A page that allocates 40,000 objects is going to be slow no matter how few queries it runs, and a page that runs 30 indexed queries is often completely fine. `rack-mini-profiler` will show you both side by side, which is why it's the first gem I add to anything.
+
+The N+1 heuristic isn't wrong. It's just a heuristic that got promoted to a rule somewhere along the way, and rules stop you from looking.

@@ -1,0 +1,89 @@
+The progress log scrolled for fifty minutes. `Migrating tenant 1 of 1,412`. `Migrating tenant 2 of 1,412`. I watched about four hundred of them go past before accepting that this was now my whole afternoon, and that adding one nullable boolean column was going to take longer than writing the feature had.
+
+We had chosen schema-per-tenant eighteen months earlier. This is the post I wish I'd read then — not because the choice was wrong, but because I'd made it for reasons that turned out not to be the ones that mattered.
+
+## The three ways to do this
+
+**Row-level.** One schema, a `tenant_id` on every table, filtered on every query.
+
+**Schema-per-tenant.** In Postgres, one namespace per tenant, each with its own copy of every table. `SET search_path` on connection checkout.
+
+**Database-per-tenant.** Full isolation, separate connection per tenant.
+
+We picked the middle one, and the reasoning went: strong isolation, no risk of leaking one customer's data into another's response, and it demos beautifully to an enterprise security reviewer. All three of those are true.
+
+What I hadn't thought about at all was that DDL is now O(tenants).
+
+## What schema-per-tenant actually costs
+
+Every migration runs once per schema. 1,412 tenants meant 1,412 `ALTER TABLE` statements per migration, serially, each in its own transaction.
+
+That's slow, which is annoying. The genuinely bad part is that it's **not atomic across tenants**. Somewhere around tenant 900, one migration hit a lock timeout on a tenant with an unusually busy table. So we had 900 tenants on the new schema, 512 on the old, and application code that had to work against both until someone resolved it by hand. Deploy in that state and half your customers get a 500 on a missing column.
+
+The other costs, roughly in the order they bit us:
+
+**Connection pooling stops being simple.** `search_path` is per-session, so a pooled connection carries the previous tenant's path until you reset it. Miss the reset in one code path and you're serving tenant A's data to tenant B — which is the exact failure the architecture was chosen to prevent. We had this bug. It was in a Sidekiq middleware.
+
+```ruby
+# The reset has to be unconditional, in an ensure, on every path.
+class TenantConnection
+  def self.with(tenant, &block)
+    previous = ActiveRecord::Base.connection.schema_search_path
+    ActiveRecord::Base.connection.schema_search_path = "#{tenant.schema_name},public"
+    yield
+  ensure
+    ActiveRecord::Base.connection.schema_search_path = previous
+    ActiveRecord::Base.connection.clear_query_cache
+  end
+end
+```
+
+**`schema.rb` becomes useless.** It describes one tenant. `rails db:setup` gives you an empty shell. New engineers lose a morning to this, every time.
+
+**Postgres itself starts complaining.** 1,412 schemas × ~40 tables is ~56,000 tables in `pg_class`. Autovacuum has more relations to consider, `\dt` becomes unusable, and — the one that actually hurt — `pg_dump` slowed to a crawl because catalog queries got expensive. Our nightly backup went from 20 minutes to over two hours across a year of customer growth, and nothing in the application changed.
+
+**Cross-tenant queries become impossible.** "How many accounts used this feature last month" is a `UNION ALL` across 1,412 schemas, generated at runtime. We ended up building a separate reporting pipeline mostly to answer questions that would have been one `GROUP BY` in the row-level design.
+
+## What row-level costs instead
+
+I don't want to make this sound one-sided, because the row-level tradeoff is real and it's a scary one: **a missing `WHERE tenant_id = ?` is a data breach.** Not a bug, a breach. One forgotten scope in one endpoint.
+
+The reason I'd still choose it now is that Postgres will enforce this for you, in the database, where forgetting isn't an option:
+
+```sql
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON orders
+  USING (tenant_id = current_setting('app.tenant_id')::bigint);
+```
+
+```ruby
+# Set once per request or job, on the connection.
+ActiveRecord::Base.connection.exec_query(
+  "SELECT set_config('app.tenant_id', $1, true)",
+  "set_tenant",
+  [tenant.id.to_s]
+)
+```
+
+With RLS on, `Order.all` returns only the current tenant's rows even if every scope in the application is wrong. The `true` third argument to `set_config` makes it transaction-local, which handles the connection-reuse problem the same way advisory transaction locks do — the setting dies with the transaction rather than lingering on a pooled connection.
+
+It's the same defence-in-depth argument as a unique index behind a validation. The application scope is the ergonomic layer; the policy is the one that's actually load-bearing. And critically, the migration story goes back to being one `ALTER TABLE`.
+
+## How I'd decide now
+
+The question I'd ask first, which I didn't: **how often will we change the schema, and how many tenants will there be?**
+
+Schema-per-tenant is genuinely good with tens of tenants. At 50 enterprise customers, a migration is a minute, `pg_dump` is fine, and the isolation story is worth real money in procurement conversations. The model breaks down somewhere in the hundreds, and where exactly depends on your table count and how often you ship schema changes.
+
+Row-level with RLS scales to as many tenants as your data volume supports, and its costs are constant rather than multiplied.
+
+Database-per-tenant I'd only do when a customer contractually requires their data in a specific region or on separate infrastructure — in which case it's not really an architecture decision, it's a compliance one, and it usually applies to a handful of accounts rather than all of them. Running two models side by side is more tractable than it sounds and better than forcing every tenant into the shape the strictest one needs.
+
+## The migration out, since someone will ask
+
+We're partway through, and the approach that's working is boring: add `tenant_id` to the shared-schema tables, backfill one tenant at a time, dual-write during the transition, cut reads over per-tenant behind a flag, then drop the schema. Roughly the expand-contract pattern applied to an architecture instead of a column.
+
+The thing that made it feasible at all was that we'd never used the isolation for anything except isolation. No tenant had a customised schema. If even twenty of them had drifted — one extra column here, a different index there — the consolidation would be a bespoke project per tenant, and I don't think we'd have attempted it.
+
+Which is maybe the sharpest version of the lesson. Schema-per-tenant *lets* you diverge per customer, and that flexibility is the reason people choose it. But if you never use it, you've paid the full price of a distributed schema for a feature you didn't want, and if you do use it you can never leave.

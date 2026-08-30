@@ -1,0 +1,119 @@
+Finance found it, which is the worst way to find it. A spreadsheet reconciliation, eleven days after the fact: 23 orders had been refunded twice.
+
+Not 23 duplicate refund *records*. Two actual movements of money per order, out the door, to real customers who mostly didn't mention it.
+
+## The code, which looks fine
+
+```ruby
+class RefundsController < ApplicationController
+  def create
+    order = Order.find(params[:order_id])
+
+    return head :conflict if order.refunded?
+
+    refund = PaymentGateway.refund(order.charge_id, order.total_cents)
+    order.update!(refunded_at: Time.current, refund_id: refund.id)
+
+    head :created
+  end
+end
+```
+
+Read that and it's obviously correct. Check whether it's refunded, refund it if not, mark it refunded.
+
+The trouble is the gap between line 5 and line 8. It's maybe 400 milliseconds, all of it spent waiting on the payment gateway, and during those 400ms the guard on line 5 is answering a question about the past.
+
+Two requests, interleaved:
+
+```
+request A: SELECT ... WHERE id = 991        -> refunded_at: nil
+request B: SELECT ... WHERE id = 991        -> refunded_at: nil
+request A: gateway.refund(...)              -> money moves
+request B: gateway.refund(...)              -> money moves again
+request A: UPDATE orders SET refunded_at    -> ok
+request B: UPDATE orders SET refunded_at    -> ok, overwrites A
+```
+
+Both passed the check. Both were right when they checked. This is a read-modify-write race, and it's the single most common correctness bug I've found in Rails apps, because the code that contains it reads as self-evidently fine.
+
+The trigger was mundane: an admin double-clicked a button whose spinner hadn't appeared yet. Twenty-three times over three weeks, by four different people.
+
+## Things I tried that don't work
+
+**A unique index on `refund_id`.** My first instinct, and it's the right instinct in general — push the invariant into the database. But it doesn't help here. The gateway generates a distinct `refund_id` per call, so both refunds have different IDs and both insert cleanly. The database was perfectly consistent. It just described two refunds that shouldn't both exist.
+
+**Wrapping it in a transaction.** This is the one I want to be emphatic about, because I've seen it shipped as a fix more than once. A transaction gives you atomicity and isolation of *database* work. It does nothing about a third-party HTTP call in the middle, and at Postgres's default `READ COMMITTED` isolation, a plain `SELECT` inside a transaction still doesn't stop another transaction reading the same row. You've added a transaction and changed nothing about the race. Worse, you now hold a database connection open across a 400ms network call, so you've traded a rare bug for permanent connection pool pressure.
+
+**Disabling the button in the UI.** We did this too, and it's worth doing. But it makes the race rarer rather than impossible, and it does nothing for the API client that retries on timeout — which is the version of this bug that hurts, because retries arrive in bursts and mean it.
+
+## Locking the row
+
+The actual fix is to make the check and the write mutually exclusive, and the tool is a row lock:
+
+```ruby
+class RefundsController < ApplicationController
+  def create
+    order = Order.lock.find(params[:order_id])   # SELECT ... FOR UPDATE
+
+    return head :conflict if order.refunded?
+
+    order.update!(refund_state: "in_progress")
+  end
+end
+```
+
+`Order.lock.find` issues `SELECT ... FOR UPDATE`, which blocks any other transaction trying to lock the same row until this one commits. The second request waits, then reads the *current* state, sees the refund, and bails.
+
+But notice the gateway call has moved out. That's the important part, and it's not incidental — holding a row lock across an external HTTP call is a bad idea for the same reason as before. If the gateway hangs for 30 seconds, so does every request touching that order, and each one is sitting on a connection.
+
+So the pattern becomes: lock briefly to claim the work, then do the slow part outside the lock.
+
+```ruby
+class Order < ApplicationRecord
+  # Returns false if someone else already claimed the refund.
+  def claim_refund!
+    with_lock do                      # BEGIN; SELECT ... FOR UPDATE
+      return false if refund_state != "none"
+      update!(refund_state: "claimed")
+    end
+    true
+  end
+end
+
+class RefundsController < ApplicationController
+  def create
+    order = Order.find(params[:order_id])
+    return head :conflict unless order.claim_refund!
+
+    RefundJob.perform_later(order.id)
+    head :accepted
+  end
+end
+```
+
+The lock is held for one `UPDATE` — microseconds. The gateway call happens in a job, where a retry is a known quantity rather than a surprise. And the state machine has three states instead of a nullable timestamp, so "we started refunding and don't yet know if it worked" is representable. That gap in the state model was arguably the root cause: `refunded_at: nil` conflated "not refunded" with "refunding right now".
+
+## Optimistic locking, and when I'd use it instead
+
+Rails also ships optimistic locking, which is a version column rather than a database lock:
+
+```ruby
+# add_column :orders, :lock_version, :integer, default: 0, null: false
+order = Order.find(id)
+order.notes = "..."
+order.save!   # raises ActiveRecord::StaleObjectError if lock_version changed
+```
+
+No blocking, no held locks; the loser finds out at write time and raises. That's a better fit for long-lived edits — a form someone had open for ten minutes, where you want "someone else changed this, please reload" rather than a lock held across a coffee break.
+
+The way I choose between them: pessimistic (`FOR UPDATE`) when the contention window is short and the operation must not double-run. Optimistic when the window is long, contention is rare, and a human can resolve the conflict.
+
+What neither of them replaces is idempotency at the boundary. Every payment gateway I've used takes an idempotency key, and passing one means a duplicate call returns the *original* refund instead of making a second one. The lock stops our code from trying twice; the key stops their system from acting twice if we do anyway. Both, always — the lock is our invariant and the key is theirs.
+
+## The habit this gave me
+
+I now read every `if x? then do_thing` against shared state as a potential race, and ask one question: what happens if two requests are between the check and the write at the same time?
+
+Most of the time the answer is "nothing much" and I move on. But if the answer involves money, email, or an external side effect, the check is decoration unless something is enforcing exclusivity — a lock, a unique index, or a conditional `UPDATE ... WHERE state = 'none'` that returns a row count you actually inspect.
+
+The reason this class of bug survives review is that concurrency isn't visible in the source. You have to bring it with you when you read.

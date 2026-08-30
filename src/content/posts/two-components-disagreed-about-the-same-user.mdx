@@ -1,0 +1,102 @@
+The bug report was four words long and made no sense: "the sidebar shows the old name".
+
+Not stale for a moment. Stale until reload. The profile page showed "Priya Raghavan", the sidebar avatar tooltip two hundred pixels away showed "Priya Nair", and both were rendering from the same application, in the same tab, at the same time.
+
+## How we got there
+
+We'd been storing fetched data in a context, because that's the pattern everyone reaches for once two components need the same thing.
+
+```jsx
+const [user, setUser] = useState(null);
+
+useEffect(() => {
+  fetch(`/api/users/${id}`)
+    .then((r) => r.json())
+    .then(setUser);
+}, [id]);
+```
+
+That block, or something very like it, existed in eleven places. `ProfileHeader` had its own. `Sidebar` had its own. `SettingsForm` had its own and also a `PATCH` handler that updated only its own copy.
+
+So there wasn't one user in the app. There were eleven, and after any mutation they diverged in whatever order the components happened to have last fetched. The "fix" for each individual report was to thread a callback up so the mutating component could tell the others — and we'd done that twice, which is how the sidebar ended up subscribing to a refetch that the settings form no longer called.
+
+## The distinction I was missing
+
+I'd been treating all state as one kind of thing. It isn't, and the split that matters is ownership.
+
+**Client state** is state your app owns and is the authority on. Is the dropdown open, which tab is selected, what's typed in the search box. There is no truth about it anywhere else. `useState` is correct and sufficient.
+
+**Server state** is a *cache of someone else's data*. The user's name lives in Postgres. Your copy is a local replica that was accurate at the moment it arrived and is decaying from then on.
+
+Once I framed it that way, the eleven `useState` calls stopped looking like state management and started looking like eleven independent caches of the same row, with no coordination, no invalidation, and no shared notion of freshness. Of course they disagreed. That's what independent caches do.
+
+Caching is a genuinely hard problem — deduplication, invalidation, staleness, revalidation, retries, race conditions between a mutation and an in-flight read. Writing `useState` plus `useEffect` and calling it done means you've decided to solve all of that by hand, in eleven places, usually without noticing you took the job.
+
+## What we replaced it with
+
+One cache, keyed, shared. We used React Query; SWR or RTK Query get you the same properties.
+
+```jsx
+export function useUser(id) {
+  return useQuery({
+    queryKey: ["user", id],
+    queryFn: () => api.get(`/users/${id}`),
+    staleTime: 30_000,
+  });
+}
+```
+
+Every component calls `useUser(id)`. Eleven call sites, one cache entry, one network request no matter how many components mount at once. The disagreement isn't fixed so much as it's made unrepresentable — there's one entry under `["user", 42]` and everyone reads it.
+
+Mutations invalidate the key rather than notifying components:
+
+```jsx
+const queryClient = useQueryClient();
+
+const rename = useMutation({
+  mutationFn: (name) => api.patch(`/users/${id}`, { name }),
+  onSuccess: () => {
+    queryClient.invalidateQueries({ queryKey: ["user", id] });
+  },
+});
+```
+
+The mutating component doesn't know or care who else is displaying the user. It says "this key is stale", and anything mounted that depends on it refetches. That inversion is the whole benefit: components stop needing to know about each other.
+
+## The race condition I'd been shipping for years
+
+There's a second bug in that original `useEffect`, and it's subtler than the duplication.
+
+Change `id` from 1 to 2 quickly. Two requests are now in flight. If the response for user 1 arrives *after* the response for user 2 — entirely possible, they're independent HTTP requests — then `setUser` is called with user 1's data last, and the UI shows user 1 while the URL says 2.
+
+The correct hand-rolled version needs a cancellation flag:
+
+```jsx
+useEffect(() => {
+  let active = true;
+
+  fetch(`/api/users/${id}`)
+    .then((r) => r.json())
+    .then((data) => {
+      if (active) setUser(data);
+    });
+
+  return () => {
+    active = false;
+  };
+}, [id]);
+```
+
+I have written the wrong version of this many more times than the right one. Not because it's difficult — it's four extra lines — but because the wrong version works perfectly on a fast connection with a local API, so nothing ever tells you. It shows up as an unreproducible ticket from someone on hotel wifi.
+
+A query library handles this by construction: results are stored under the key they were requested for, so a late response for `["user", 1]` lands in the entry nobody is reading anymore.
+
+## Where I draw the line now
+
+Before adding state, one question: **is this app the authority on this value?**
+
+If yes, `useState`, and keep it as close to where it's used as possible. Local state is not a problem to be solved.
+
+If no — it came from an API and could change without us — it's a cache, and it goes in the query cache with a key. Never in a `useState` next to a `useEffect`, and never in a context that exists only to share fetched data.
+
+That last one is worth saying plainly, because "put the data in context" is such standard advice. Context is a dependency injection mechanism. It's excellent for things that are genuinely ambient — the theme, the current locale, the authenticated session. Using it as a cache means you've built a cache with no eviction, no staleness tracking, and a re-render fan-out to every consumer on every change. Which is roughly where we started, just with the eleven copies consolidated into one badly-behaved one.

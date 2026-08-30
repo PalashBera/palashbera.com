@@ -1,0 +1,117 @@
+We added caching to the pricing endpoint on a Thursday. On Friday at 14:00 the database hit 100% CPU and stayed there for nine minutes, which it had never done before we made it faster.
+
+The endpoint computed a price from about a dozen inputs and took 900ms. We wrapped it in a five-minute cache, watched the average drop to 40ms, and considered it finished.
+
+## The stampede
+
+`Rails.cache.fetch` does exactly what it says: check the cache, and on a miss, compute the value and store it. What it doesn't do is coordinate between callers.
+
+At 40 requests per second, a five-minute expiry means that every five minutes, the key vanishes and roughly 40 requests discover the miss within the same 25 milliseconds. All 40 run the 900ms computation. All 40 write the same value back.
+
+So instead of one expensive query every five minutes, we had 40 simultaneous expensive queries every five minutes — and because they overlapped, each one was slower than it had been in isolation, which widened the window, which let more requests in. The database saw a burst 40× worse than the uncached load it had been handling comfortably.
+
+This is a cache stampede, or a thundering herd, and the thing that makes it nasty is that it scales with your traffic. The busier you are, the worse the burst, and it's invisible in average latency because 99% of requests genuinely are fast.
+
+## Locking the recompute
+
+The first fix is to let one caller do the work while the others wait or serve stale.
+
+```ruby
+class PricingCache
+  TTL = 5.minutes
+  LOCK_TTL = 30.seconds
+
+  def self.fetch(key)
+    cached = Rails.cache.read(key)
+    return cached if cached
+
+    # Only the caller that wins the lock recomputes.
+    if Rails.cache.write("#{key}:lock", 1, unless_exist: true, expires_in: LOCK_TTL)
+      begin
+        value = yield
+        Rails.cache.write(key, value, expires_in: TTL)
+        value
+      ensure
+        Rails.cache.delete("#{key}:lock")
+      end
+    else
+      # Someone else is on it. Wait briefly, then fall back.
+      sleep 0.05
+      Rails.cache.read(key) || yield
+    end
+  end
+end
+```
+
+`unless_exist: true` maps to Redis `SET NX`, which is atomic — that's the whole mechanism. Without it you've reproduced the same race one level up.
+
+But look at the `else` branch, because it's where this pattern usually goes wrong. `sleep 0.05` then `yield` if it's still missing means that under enough load you're back to a stampede, just 50ms later, with a Puma thread held in the meantime. Sleeping in a request handler to wait for a cache is trading a database problem for a thread pool problem.
+
+## Serving stale while refreshing
+
+The better answer, and what we settled on, is to never let the key expire out from under you. Store a logical freshness timestamp alongside the value, and refresh in the background.
+
+```ruby
+class PricingCache
+  FRESH_FOR = 5.minutes
+  KEEP_FOR = 1.hour
+
+  Entry = Struct.new(:value, :computed_at, keyword_init: true)
+
+  def self.fetch(key, &block)
+    entry = Rails.cache.read(key)
+
+    if entry.nil?
+      # Genuine cold start: compute inline, nothing else to serve.
+      return store(key, block.call).value
+    end
+
+    if entry.computed_at < FRESH_FOR.ago
+      # Stale but usable. Refresh out of band, serve what we have.
+      PricingRefreshJob.perform_async(key) unless refresh_pending?(key)
+    end
+
+    entry.value
+  end
+
+  def self.store(key, value)
+    entry = Entry.new(value: value, computed_at: Time.current)
+    Rails.cache.write(key, entry, expires_in: KEEP_FOR)
+    entry
+  end
+
+  def self.refresh_pending?(key)
+    !Rails.cache.write("#{key}:refreshing", 1, unless_exist: true, expires_in: 1.minute)
+  end
+end
+```
+
+Two expiries doing different jobs. `FRESH_FOR` is when we'd *like* new data, and crossing it enqueues a job. `KEEP_FOR` is when the entry is genuinely too old to serve. Between them, requests are always fast and always answered from cache.
+
+The property that matters: **no user-facing request ever pays for a recompute** except on a true cold start. The expensive work happens in Sidekiq, where it can be slow, retried, and rate-limited without anyone watching a spinner.
+
+This is what `stale-while-revalidate` means in HTTP caching, and it's the right default for anything expensive whose value tolerates being a few minutes old. Which, when you actually ask, is most things.
+
+## Jitter, because synchronised expiry is a choice
+
+Even with the above, identical TTLs synchronise. Deploy at 14:00, warm 200 keys in the first minute, and they all cross their freshness threshold together at 14:05 — 200 refresh jobs at once.
+
+```ruby
+def self.fresh_for
+  FRESH_FOR + rand(0..60).seconds
+end
+```
+
+One line, spreads the herd across a minute. The same reasoning applies to retry backoff, to cron schedules across services, and to anything where N things share a deadline. Sidekiq's default retry already jitters; hand-rolled backoff usually doesn't.
+
+## The question I ask before caching anything now
+
+I used to treat caching as a free speedup. It isn't — it's a distributed system you're adding to your app, and it comes with all the usual questions:
+
+**How does it behave on a miss under load?** If the answer is "every concurrent request recomputes", you have a stampede waiting for the traffic that triggers it. This is the one nobody checks, because a cache miss in development is one request.
+
+**What's the correctness cost of stale data?** Five minutes stale on a price shown before checkout is a support ticket about a price change. Five minutes stale on a dashboard tile is nothing. These need different designs and the difference is a product question, not a technical one.
+
+**What happens when the cache is empty?** After a Redis restart or a flush, can the origin survive 100% miss rate? If not, the cache isn't an optimisation — it's a dependency, and it needs to be in your capacity planning and your incident runbook. We found out ours was during an unrelated Redis upgrade.
+
+The thing I'd underline: caching didn't make our system faster, it made it *spikier*. Average latency improved and the worst case got dramatically worse. If you only watch averages — and the whole appeal of a cache is what it does to your average — you won't see the trade you made until the database does.

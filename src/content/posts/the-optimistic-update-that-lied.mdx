@@ -1,0 +1,124 @@
+"I archived about thirty of them on the train and none of it saved."
+
+She had. She'd worked through an inbox for twenty minutes, watched each row slide away, and arrived at an empty list. Then the tunnel ended, the app reloaded, and all thirty were back.
+
+Every single archive had shown success. None of them had happened.
+
+## Optimistic updates are a promise you're making
+
+The pattern is genuinely good. Don't wait for the server; assume it'll work, update the UI now, reconcile later. On a 200ms connection it's the difference between an app that feels responsive and one that feels like a form submission from 2006.
+
+What I hadn't internalised is that it's a *promise*, and we'd built no mechanism for breaking it honestly.
+
+```jsx
+const archive = useMutation({
+  mutationFn: (id) => api.post(`/threads/${id}/archive`),
+  onMutate: async (id) => {
+    await queryClient.cancelQueries({ queryKey: ["threads"] });
+    queryClient.setQueryData(["threads"], (old) =>
+      old.filter((t) => t.id !== id),
+    );
+  },
+});
+```
+
+Row disappears instantly. Ships, demos well, and is wrong in one specific way: there's no `onError`. When the request failed, the cache kept the optimistic value forever, because nothing ever put it back.
+
+The offline case made it worse in a way I hadn't considered. `fetch` doesn't fail fast when there's no connectivity — it hangs. So thirty mutations sat pending, thirty rows vanished, and no error handler would have fired anyway because nothing had errored yet.
+
+## Rollback needs the previous value, not a reverse operation
+
+The correct shape captures a snapshot and restores it:
+
+```jsx
+const archive = useMutation({
+  mutationFn: (id) => api.post(`/threads/${id}/archive`),
+
+  onMutate: async (id) => {
+    await queryClient.cancelQueries({ queryKey: ["threads"] });
+    const previous = queryClient.getQueryData(["threads"]);
+
+    queryClient.setQueryData(["threads"], (old) =>
+      old.filter((t) => t.id !== id),
+    );
+
+    return { previous };
+  },
+
+  onError: (_error, _id, context) => {
+    queryClient.setQueryData(["threads"], context.previous);
+    toast.error("Couldn't archive that. Put it back.");
+  },
+
+  onSettled: () => {
+    queryClient.invalidateQueries({ queryKey: ["threads"] });
+  },
+});
+```
+
+Three things I got wrong before landing on this.
+
+**`cancelQueries` first.** Without it, a refetch already in flight can resolve after your optimistic write and clobber it with server data that doesn't include the change yet. The row reappears for a second, then vanishes again. That flicker was reported separately as its own bug.
+
+**Snapshot, don't invert.** My first rollback re-inserted the removed thread. That's a reverse operation, and it loses information — it put the row back at the end of the list instead of position four, and if two archives were in flight the second rollback would restore a list that already had the wrong contents. Restoring the whole previous value is less clever and always right.
+
+**`onSettled`, not `onSuccess`.** Revalidate after either outcome. On success the server may have changed more than you predicted — an `updated_at`, a counter, a derived label. Your optimistic guess was an approximation and the server's answer is the real one.
+
+## The bit that actually fixed the train
+
+Rollback still isn't enough when there's no network, because there's nothing to roll back *to* that the user would accept. She did the work. Discarding it is a defensible product decision but it needs to be a decision, not a side effect.
+
+Two changes.
+
+Detect the condition and stop pretending:
+
+```jsx
+const online = useSyncExternalStore(
+  (cb) => {
+    window.addEventListener("online", cb);
+    window.addEventListener("offline", cb);
+    return () => {
+      window.removeEventListener("online", cb);
+      window.removeEventListener("offline", cb);
+    };
+  },
+  () => navigator.onLine,
+  () => true,
+);
+```
+
+`navigator.onLine` is a blunt instrument — it tells you there's *a* network interface, not that requests will succeed, and captive portals will lie to you. It's enough to stop accepting new optimistic mutations and show a banner, which is most of the value.
+
+And give the request a deadline, so a hanging fetch becomes an error your handlers can see:
+
+```jsx
+async function post(url, body, { timeoutMs = 10_000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`${response.status}`);
+    return response.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+That's the change that mattered most, and it's not really about optimistic updates at all. A `fetch` with no timeout is a promise that might never settle, and every piece of error handling downstream is unreachable until it does. We added this to the shared client and three unrelated "it just spins forever" tickets closed themselves.
+
+## Where I'll use optimistic updates now
+
+Only when I can answer all three:
+
+1. **Can I predict the result?** Toggling a boolean, removing a row, incrementing a count — yes. Anything where the server assigns an ID, computes a total, or runs validation I can't replicate locally — no. Show a pending state and wait.
+2. **Is being wrong cheap?** A star that un-stars itself with a toast is fine. A payment that appears to succeed is not. Optimism is for things where the apology is proportionate.
+3. **Will the user still be here to see the rollback?** This is the one I'd never thought about. If the action is followed by a navigation, the component that would have shown your error is unmounted, and the failure is silent. For anything like that, wait for the server before moving on.
+
+The thirty archived threads failed test three, mostly. But the deeper problem was that "optimistic" had quietly become "unverified" — we'd taken the latency win and never built the half of the pattern that makes it honest.

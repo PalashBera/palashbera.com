@@ -1,0 +1,100 @@
+Our ECS bill said we were running 24 vCPUs of application containers. Our CPU utilisation graph said we were using 11% of it. Requests were still queueing.
+
+Paying for four times the compute we appeared to need, and still too slow. That combination is almost always a scheduling problem rather than a capacity problem — the work and the machine are mismatched in shape, not in size.
+
+## The two numbers nobody had chosen on purpose
+
+Every containerised Rails app has two settings that decide its concurrency, and in our case both had been inherited from a tutorial.
+
+`RAILS_MAX_THREADS`, which set the Puma thread pool at 5. And the container's CPU allocation, which was 1 vCPU. Those numbers were picked independently, by different people, eighteen months apart.
+
+Here's what makes this awkward: the right thread count depends entirely on what your requests spend their time doing, and MRI Ruby has a global VM lock, so only one thread executes Ruby at a time per process. Threads help when they're *waiting* — on Postgres, on Redis, on an HTTP call — because a waiting thread releases the lock.
+
+So the useful question isn't "how many threads" but "what fraction of a request is spent waiting".
+
+We got that from the APM breakdown: our average request was about 25ms in Postgres, 10ms in external HTTP, and 15ms in Ruby. Roughly 70% waiting. With 5 threads and 1 vCPU we could keep the CPU busy, but we were also hitting the thread pool ceiling under bursts while the CPU sat idle — queueing on threads, not on compute.
+
+## Processes for CPU, threads for waiting
+
+The fix is both dials, together. Puma's worker processes give you real parallelism (separate VM locks); threads within a worker give you cheap concurrency for I/O.
+
+```ruby
+# config/puma.rb
+workers Integer(ENV.fetch("WEB_CONCURRENCY", 2))
+threads_count = Integer(ENV.fetch("RAILS_MAX_THREADS", 5))
+threads threads_count, threads_count
+
+preload_app!
+
+on_worker_boot do
+  ActiveRecord::Base.establish_connection
+end
+```
+
+The constraint that matters, and the one I've seen break more deploys than any other: **the database connection pool is per process, and total connections is the product of everything.**
+
+```
+containers × puma workers × threads ≤ database max_connections (minus headroom)
+```
+
+Six containers × 2 workers × 5 threads is 60 connections from the web tier alone, before Sidekiq, before your console, before whatever background script someone is running. On an RDS instance whose `max_connections` is 100, adding two more containers during a traffic spike is how you take the database down while trying to handle load. Every autoscaling policy on a Rails app needs this arithmetic done once, on paper, with the actual `max_connections` in front of you. This is what PgBouncer is for, and "we'll add PgBouncer later" is a sentence I've now said twice and regretted twice.
+
+Set the pool to match the threads, or you get connection timeouts under exactly the load you scaled up to handle:
+
+```yaml
+# config/database.yml
+production:
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS", 5) %>
+```
+
+## The CPU limit that made things worse
+
+The other half was the container CPU limit, and this is the part that surprised me.
+
+Kubernetes CPU limits are enforced by CFS quota: your container gets N microseconds of CPU per 100ms period, and when the quota runs out the kernel stops scheduling it until the next period. Not "runs slower" — *stops*.
+
+For a request-serving process, that produces latency spikes that look like nothing else. Average CPU utilisation is low, because averaged over a minute it genuinely is. But a request that arrives 80ms into a period where the quota is spent waits 20ms for the next one, doing nothing.
+
+That was our 11%-utilisation-and-still-slow. We were being throttled in bursts and averaging it away.
+
+```bash
+# The number that tells you. Non-zero and climbing means throttling.
+cat /sys/fs/cgroup/cpu.stat | grep throttled
+# nr_throttled 41827
+# throttled_usec 9183440000
+```
+
+What we changed:
+
+- **Requests set honestly, limits removed** on the web tier. Requests are what the scheduler uses for placement, so they're what actually gets you a fair share; the limit was only capping our bursts. This is contentious and depends on your cluster having sane bin-packing, but for latency-sensitive services it was unambiguously right for us.
+- **Kept limits on Sidekiq.** Batch work should be throttled rather than allowed to starve the web tier — for a job queue, throughput matters and tail latency doesn't.
+- **Fewer, larger containers.** Two containers at 2 vCPU with 2 Puma workers each beat six at 1 vCPU, because a single-vCPU container running a multi-process server spends real time context-switching, and every container carries the same fixed memory overhead for the preloaded app.
+
+Requests went from a p99 of 2.4s to 340ms. We removed a third of the containers.
+
+## Sidekiq needs the opposite reasoning
+
+Same arithmetic, different answer, and I initially copied the web settings across, which was wrong.
+
+Sidekiq's `concurrency` is a thread count in one process, so the GVL applies the same way. But job workloads are usually less I/O-bound than requests — a report generator or an image resize is Ruby burning CPU, and 25 threads of that on one core just means 25 things all being slow at once while the memory footprint multiplies.
+
+```yaml
+# config/sidekiq.yml
+:concurrency: 10
+:queues:
+  - [critical, 4]
+  - [default, 2]
+  - [low, 1]
+```
+
+The weighted queues matter as much as the concurrency. With a flat list, one customer's 40,000-row export will occupy every thread and your password reset emails wait behind it. The weights make starvation much less likely, though the real answer for genuinely different workloads is separate deployments with their own containers and their own concurrency — at which point you're back to sizing each one for what it actually does.
+
+## The order I'd do this in
+
+1. **Find out where request time goes.** Waiting or computing? Everything downstream depends on this and it's one APM screen.
+2. **Do the connection arithmetic** with your real `max_connections`. Before autoscaling, not after.
+3. **Check for CPU throttling** in cgroup stats. Low average utilisation with bad tail latency is the signature, and it's invisible on a utilisation dashboard.
+4. **Size workers to cores, threads to waiting**, and set the AR pool to the thread count.
+5. **Do it again separately for Sidekiq**, because the workload is a different shape.
+
+None of this is exotic. What made it a six-month problem was that the two numbers controlling concurrency lived in different files, owned by different people, and the symptom — expensive and slow — pointed at capacity, which is the one thing it wasn't.

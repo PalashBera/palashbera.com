@@ -1,0 +1,137 @@
+Renaming a column is a one-line migration and a forty-minute outage, and I found that out the way everyone does.
+
+```ruby
+rename_column :users, :name, :full_name
+```
+
+The migration ran in 8ms. Then, for the length of the rolling deploy, half the containers were running code that selected `name` from a table that no longer had it. Every request they served returned a 500.
+
+The migration was fine. The problem was that during a rolling deploy there are two versions of the application running, and I'd written a schema change that only one of them could work with.
+
+## The window you can't avoid
+
+Any deploy that doesn't take the whole site down has an overlap period. Old containers are draining, new ones are warming, and for somewhere between thirty seconds and several minutes both are serving traffic against the same database.
+
+That gives you a constraint that's easy to state and easy to forget: **the schema must be compatible with the version before and the version after, simultaneously.**
+
+`rename_column` is the clearest violation. It's two operations pretending to be one — add the new name, remove the old — and it does them atomically, which is exactly wrong. You want them in separate deploys with the application taught about both in between.
+
+## Expand and contract
+
+The pattern has a few names; this is the one I use. Split the change into three deploys, each individually safe.
+
+**Deploy 1 — expand.** Add the new thing. Don't remove anything. Write to both.
+
+```ruby
+class AddFullNameToUsers < ActiveRecord::Migration[7.1]
+  def change
+    add_column :users, :full_name, :string
+  end
+end
+```
+
+```ruby
+class User < ApplicationRecord
+  # Old code reads `name`; new code reads `full_name`. Keep both true.
+  before_save :sync_name_columns
+
+  private
+
+  def sync_name_columns
+    if full_name_changed?
+      self.name = full_name
+    elsif name_changed?
+      self.full_name = name
+    end
+  end
+end
+```
+
+Old containers write `name`, and the callback fills `full_name`. New containers do the reverse. Both versions see complete data whichever one handled the request.
+
+**Backfill, separately from the deploy.** In batches, not in a migration:
+
+```ruby
+class BackfillFullName
+  def self.run(batch_size: 5_000)
+    User.where(full_name: nil).in_batches(of: batch_size) do |batch|
+      batch.update_all("full_name = name")
+      sleep 0.1   # let replication and autovacuum keep up
+    end
+  end
+end
+```
+
+A `update_all` across the whole table inside a migration holds one long transaction, bloats the WAL, and blocks your deploy on it. Batching with a pause keeps replica lag survivable and means a failure resumes rather than restarts.
+
+**Deploy 2 — migrate reads.** All code reads `full_name`. The dual-write stays. Nothing schema-level changes, so this deploy is trivially reversible.
+
+**Deploy 3 — contract.** Now that nothing references it, drop the old column and the callback.
+
+```ruby
+class RemoveNameFromUsers < ActiveRecord::Migration[7.1]
+  def up
+    safety_assured { remove_column :users, :name }
+  end
+
+  def down
+    add_column :users, :name, :string
+  end
+end
+```
+
+Three deploys to rename a column. It feels absurd the first time. It's about twenty minutes of extra work and it's the difference between a routine change and an incident.
+
+## The one that catches everyone: removing a column
+
+`remove_column` looks like the safest possible operation. Nothing reads it, so nothing can break.
+
+It breaks anyway, and the reason is genuinely surprising: ActiveRecord caches the column list per process at boot. An old container that started before the migration still believes `name` exists, so it generates `SELECT users.id, users.name, ... FROM users` — an explicit column list, not `SELECT *`. The column is gone, the query is invalid, every read of that table fails on that container until it restarts.
+
+The fix is to tell the model to ignore it _first_, in its own deploy:
+
+```ruby
+class User < ApplicationRecord
+  self.ignored_columns = ["name"]
+end
+```
+
+Ship that. Every container's cached column list now excludes `name`. _Then_ drop it.
+
+## What's safe and what isn't
+
+Roughly the list I keep in my head, for Postgres:
+
+**Safe, no lock worth worrying about**
+
+- Adding a nullable column, or one with a constant default (Postgres 11+ doesn't rewrite the table)
+- `CREATE INDEX CONCURRENTLY`
+- Adding a check constraint as `NOT VALID`, then validating it separately
+- Dropping an index concurrently
+
+**Dangerous**
+
+- `rename_column`, `rename_table` — two versions can't both work
+- `remove_column` without `ignored_columns` first
+- Adding a `NOT NULL` constraint to an existing column (full table scan under an exclusive lock)
+- `CREATE INDEX` without `CONCURRENTLY` (blocks writes for the build)
+- Changing a column type in place
+- Adding a foreign key in one step (use `validate: false`, then validate)
+
+Two guardrails do most of the work here. [strong_migrations](https://github.com/ankane/strong_migrations) fails the build on the dangerous list and prints the safe alternative, which teaches the pattern much better than a wiki page nobody reads. And a `lock_timeout` means a migration that can't get its lock quickly fails rather than queueing — because a pending `ACCESS EXCLUSIVE` lock blocks every read behind it, so a slow migration doesn't just wait, it takes the table down while waiting.
+
+```ruby
+# config/database.yml
+production:
+  variables:
+    lock_timeout: "3s"
+    statement_timeout: "60s"
+```
+
+## The habit
+
+Before any migration, one question: if this runs and then a container from the previous release serves a request, does that request work?
+
+If no, it's not one deploy. It's an expand, a backfill, a read switch, and a contract — and the only part you can skip is the backfill, when the column is new and nothing needs a historical value.
+
+Rails makes this trap easy to fall into, because `rename_column` exists, reads as a single intent, and is genuinely the right operation on a database nobody is talking to. The generator has no way to know you've got four containers mid-rollout.

@@ -1,0 +1,113 @@
+The ticket said "typing lags on the intake form, sometimes letters go missing". I couldn't reproduce it, closed it as unclear, and reopened it three weeks later when a second person described it identically and mentioned they were on a work-issued laptop from 2019.
+
+The form had 118 fields. It was a clinical intake questionnaire, and it needed all of them.
+
+## Why it was slow
+
+Every field was controlled, every value lived in one state object, and the whole thing was one component.
+
+```jsx
+const [values, setValues] = useState({});
+
+const update = (name) => (event) =>
+  setValues((prev) => ({ ...prev, [name]: event.target.value }));
+
+return (
+  <form>
+    {FIELDS.map((field) => (
+      <Field key={field.name} {...field} value={values[field.name] ?? ""} onChange={update(field.name)} />
+    ))}
+  </form>
+);
+```
+
+One keystroke in one field sets state on the parent, which re-renders, which re-renders all 118 `Field` components, each of which does a bit of validation and formatting work. On my machine that was about 9ms — invisible. On a five-year-old ThinkPad it was closer to 70ms.
+
+At 70ms per keystroke, a fast typist outruns React. Characters weren't literally lost; input events landed while the previous render was still committing, and the controlled `value` prop snapped the field back to a stale value. From the user's side that's indistinguishable from dropped letters.
+
+`update(field.name)` returning a fresh closure on every render didn't help either, since it defeats any memoisation on `Field` — but `React.memo` on the children was treating a symptom. The real problem was that a change to one field was, architecturally, a change to the entire form.
+
+## Measuring before guessing
+
+I want to flag the order here, because my instinct was to start wrapping things in `useMemo`, and that would have been a wasted week.
+
+The React DevTools profiler answers this directly. Record, type one character, look at the flame chart: 118 components rendered, 4ms of "actual" work in the field being typed into, 66ms across the other 117. That's not a slow component. That's the wrong component boundary.
+
+`<Profiler>` gets you the same number in CI, which is worth having once you've fixed something like this so it doesn't regress:
+
+```jsx
+<Profiler
+  id="IntakeForm"
+  onRender={(id, phase, actualDuration) => {
+    if (actualDuration > 16) console.warn(`${id} ${phase} took ${actualDuration}ms`);
+  }}
+>
+  <IntakeForm />
+</Profiler>
+```
+
+16ms because that's one frame at 60Hz. Anything over it during typing is visible.
+
+## Uncontrolled inputs, which felt like going backwards
+
+The fix was to stop making React responsible for the value of every keystroke.
+
+An uncontrolled input keeps its value in the DOM. React renders it once and then leaves it alone; you read the values when you need them. No state update per character, no re-render, nothing to be stale.
+
+```jsx
+function IntakeForm({ onSubmit }) {
+  const formRef = useRef(null);
+
+  const submit = (event) => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(formRef.current));
+    onSubmit(data);
+  };
+
+  return (
+    <form ref={formRef} onSubmit={submit}>
+      {FIELDS.map((field) => (
+        <input
+          key={field.name}
+          name={field.name}
+          defaultValue={field.initial}
+          type={field.type}
+        />
+      ))}
+    </form>
+  );
+}
+```
+
+Typing became free. Not faster — free, in the sense that React does no work at all.
+
+This felt like a regression when I first wrote it, because "controlled inputs are the React way" is something I'd absorbed without examining. But the platform has a perfectly good text input with its own state, and re-implementing that state in a virtual DOM buys you nothing unless something else needs to *read* the value while it's being typed.
+
+In practice we used React Hook Form rather than raw refs, since it does this properly — uncontrolled by default, subscriptions per field so validation messages update without touching siblings, and it handles the awkward parts like arrays and resets:
+
+```jsx
+const { register, handleSubmit, formState: { errors } } = useForm({
+  mode: "onBlur",   // not onChange; validating every keystroke was half the cost
+});
+
+<input {...register("email", { required: true, pattern: EMAIL })} />
+```
+
+`mode: "onBlur"` was worth as much as the uncontrolled switch. Validating 118 fields on every change means running 118 validators per character, and it's also hostile — telling someone their email is invalid when they've typed "p" is noise.
+
+## When controlled is still right
+
+I don't want this to read as "controlled inputs are bad". The question is whether anything needs the value *during* typing:
+
+- **A search box filtering a list as you type** — controlled. That's the entire feature.
+- **A character counter, or a field that formats as you go** (phone numbers, currency) — controlled, but scope the state to that one field's component so a re-render is one input rather than the form.
+- **Cross-field validation on blur, or a submit button that enables when required fields are filled** — uncontrolled is fine. Subscribe to the specific thing you need rather than every keystroke.
+- **A large form where you just need the values on submit** — uncontrolled, always. This was 118 of our 118 fields.
+
+The general shape, which I now try to apply before reaching for memoisation: don't make a value live in React state unless React needs to react to it. Most of the time the DOM is a perfectly adequate store and it's already there.
+
+## The uncomfortable part
+
+I closed this ticket the first time because I couldn't reproduce it, and I couldn't reproduce it because I was developing on an M-series laptop against a local API.
+
+The performance work we'd done to that point had been guided by what felt slow to me, which meant we'd optimised for the fastest hardware any of our users had. Adding CPU throttling to the profiling routine — Chrome DevTools, Performance panel, 4× slowdown, which is roughly a mid-range Android phone — changed which problems we could see at all. It's one dropdown, and it's the difference between "works on my machine" being a joke and being a methodology.

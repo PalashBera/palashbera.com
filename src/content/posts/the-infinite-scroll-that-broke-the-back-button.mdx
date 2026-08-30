@@ -1,0 +1,116 @@
+Analytics found this one before any human complained about it, which I think is why it had survived for so long.
+
+On the search results page, 34% of sessions ended immediately after a back navigation. People searched, scrolled a long way, opened a result, hit back — and landed at the top of an empty list with their query gone. Then they left, because the alternative was doing all of it again.
+
+Nobody filed a bug. They just stopped using search.
+
+## The state that wasn't anywhere
+
+```jsx
+function SearchPage() {
+  const [query, setQuery] = useState("");
+  const [filters, setFilters] = useState({ status: "all" });
+  const [pages, setPages] = useState([]);
+  // ...
+}
+```
+
+Everything about what the user was looking at lived in component state. The URL was `/search` from the first keystroke to the last page of results.
+
+So the back button worked exactly as specified. It returned to `/search`, React remounted the component, `useState("")` ran, and every piece of the user's twenty seconds of work was gone. The browser had no idea anything had happened, because we'd never told it.
+
+The same root cause produced three tickets we'd been treating as separate features: results couldn't be shared, couldn't be bookmarked, and refreshing reset everything.
+
+## The URL is state, and it's the only state the browser can restore
+
+This is the reframe that fixed it. The address bar isn't a label describing where you are — it's a serialised, shareable, history-integrated store that the platform manages for you. Anything that should survive a reload, a share, or a back navigation belongs in it.
+
+```jsx
+function SearchPage() {
+  const [params, setParams] = useSearchParams();
+
+  const query = params.get("q") ?? "";
+  const status = params.get("status") ?? "all";
+
+  const results = useInfiniteQuery({
+    queryKey: ["search", query, status],
+    queryFn: ({ pageParam }) => api.search({ query, status, cursor: pageParam }),
+    getNextPageParam: (last) => last.nextCursor,
+    initialPageParam: null,
+  });
+}
+```
+
+`query` and `status` stopped being state and became *derived from* the URL. There's no `setQuery`, no synchronisation, no `useEffect` keeping two copies in step. One source of truth that the browser already knows how to save.
+
+The typing case needs care, though, because a `pushState` per keystroke makes the back button useless in a new way — thirty history entries for "postgres migration". Replace while typing, push when it settles:
+
+```jsx
+const onType = (value) => {
+  setParams((prev) => {
+    const next = new URLSearchParams(prev);
+    value ? next.set("q", value) : next.delete("q");
+    return next;
+  }, { replace: true });          // no history entry per character
+};
+
+const onSubmit = (value) => {
+  setParams({ q: value }, { replace: false });   // this one is navigable
+};
+```
+
+The rule I settled on: **replace for continuous input, push for discrete decisions.** Typing replaces. Submitting, changing a filter, or opening a result pushes. That maps onto what people expect back to mean — undo my last *decision*, not my last keystroke.
+
+## Restoring scroll, and the loading trap
+
+URL state got the query back. Scroll position was a separate problem, and my first attempt failed in a way that took a while to see.
+
+```jsx
+// Doesn't work. Runs before the results exist.
+useEffect(() => {
+  window.scrollTo(0, Number(sessionStorage.getItem("searchScroll") ?? 0));
+}, []);
+```
+
+On mount the list is empty, the document is 800px tall, and scrolling to 4,200 does nothing. Milliseconds later the results arrive, the page becomes tall enough, and you're still at the top. The restore has to wait until the content that makes the position meaningful exists.
+
+Browsers do a decent job of this themselves when the content is server-rendered and the height is stable. With client-fetched infinite scroll it can't, because at restore time the page genuinely is empty. So you have to turn off the browser's attempt and do it after the data lands:
+
+```jsx
+// Once, at app start — otherwise the browser fights you.
+if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+```
+
+```jsx
+const key = `scroll:${location.search}`;
+const restored = useRef(false);
+
+useEffect(() => {
+  const save = () => sessionStorage.setItem(key, String(window.scrollY));
+  window.addEventListener("pagehide", save);
+  return () => {
+    save();
+    window.removeEventListener("pagehide", save);
+  };
+}, [key]);
+
+useEffect(() => {
+  if (restored.current || results.isPending) return;
+  restored.current = true;
+
+  const target = Number(sessionStorage.getItem(key) ?? 0);
+  if (target > 0) window.scrollTo({ top: target, behavior: "instant" });
+}, [key, results.isPending]);
+```
+
+Keying the saved position on `location.search` matters: a different query is a different list, and restoring a scroll offset from one search into the results of another puts people somewhere arbitrary. And `pagehide` rather than `beforeunload`, because `beforeunload` is unreliable on mobile Safari when the app is backgrounded — which is where most of these sessions were.
+
+Storing how many pages were loaded is the same idea (`?pages=4` or a cursor in the URL) so the fetch on restore covers the same range. That one's a genuine tradeoff: refetching four pages is slower than one, and it's still much better than losing the position.
+
+## What made this hard to notice
+
+The bug is invisible during development. You test search by typing a query, looking at the first ten results, and clicking one. Back works, because you never scrolled and your list was short and the API was fast.
+
+It only breaks when someone scrolls far enough that the top of the list stops being an acceptable place to land — which requires real data volumes and a real reason to be looking. Every condition for reproducing it is a condition of the app being *useful*.
+
+I've started asking one question of any list view, and it catches a surprising amount: if someone bookmarked this exact screen and opened it tomorrow, would they get this screen back? If the answer is no, some state that should be in the URL isn't, and there's a back button bug waiting whether or not anyone has reported it.

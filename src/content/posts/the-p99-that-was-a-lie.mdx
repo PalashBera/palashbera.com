@@ -1,0 +1,91 @@
+Our dashboard said the p99 was 240ms. Support had a folder of screenshots from customers showing spinners, and one video of someone waiting eleven seconds for a page we'd measured at a quarter of a second.
+
+Both were accurate. The dashboard wasn't lying about what it measured. It was measuring something other than what anyone experienced.
+
+## Averaging percentiles doesn't work
+
+The first problem was arithmetic, and I'd been doing it wrong for years without noticing.
+
+We had six containers. Each reported its own p99 every minute. The dashboard graphed the mean of those six numbers and called it the p99.
+
+There is no operation that turns six p99s into one p99. A percentile isn't additive — you can't average it, you can't sum it, and you can't take a percentile of percentiles. If five containers are idle at 20ms and one is melting at 4 seconds, the mean of the six p99s is around 660ms, while the actual 99th percentile across all requests could be far worse or much better depending on how the traffic was distributed. The number on the screen was a statistic about our containers, not about our requests.
+
+The fix is to aggregate the *distribution*, not the summary. Modern metrics backends do this if you give them histograms:
+
+```ruby
+# Emit buckets, not a pre-computed percentile.
+StatsD.distribution(
+  "http.request.duration",
+  duration_ms,
+  tags: ["endpoint:#{endpoint}", "status:#{status}"]
+)
+```
+
+A histogram is mergeable — bucket counts add up across containers, and you compute the percentile once at query time over the combined counts. `timing` in most StatsD clients aggregates per-host and ships summaries, which is how you end up averaging percentiles without ever deciding to.
+
+That change alone moved our reported p99 from 240ms to 1.9s. Nothing got slower. We just started measuring the right population.
+
+## The requests that weren't in the data
+
+The second problem was worse, and it explained the eleven-second video.
+
+Our timing middleware measured from the start of the Rails request to the end. Reasonable. But the eleven seconds was mostly spent *before* Rails saw it — queued in Puma, waiting for a thread, because all five threads were busy with slow requests.
+
+That queue time is invisible to any instrumentation inside the request. From Rails' point of view the request took 180ms, and it did. It just started ten seconds after the user asked for it.
+
+Puma exposes the wait via a header the proxy sets:
+
+```ruby
+# config/initializers/queue_time.rb
+class QueueTimeMiddleware
+  def initialize(app) = @app = app
+
+  def call(env)
+    if (started = env["HTTP_X_REQUEST_START"])
+      queued_ms = (Time.now.to_f * 1000) - parse_start_ms(started)
+      StatsD.distribution("http.request.queue_time", queued_ms) if queued_ms >= 0
+    end
+
+    @app.call(env)
+  end
+
+  private
+
+  # nginx: proxy_set_header X-Request-Start "t=${msec}";
+  def parse_start_ms(value)
+    Float(value.delete_prefix("t=")) * 1000
+  end
+end
+```
+
+Queue time is the single most useful number I know for a threaded Ruby app. Service time tells you whether your code is slow. Queue time tells you whether you have enough capacity. They fail independently, they have different fixes — optimise a query versus add a container — and if you only measure one you will confidently apply the wrong fix.
+
+Ours had a p99 of 9.4 seconds while service time sat at 180ms. We'd spent two sprints optimising queries.
+
+## Tail latency is the number users feel
+
+The third thing was conceptual, and it's the one I bring to every performance conversation now.
+
+A page that makes 20 API calls and waits for all of them doesn't experience your p99 once per 100 requests. It experiences it whenever *any* of the 20 calls is slow. If each call independently has a 1% chance of being slow, the chance that at least one of them is slow is:
+
+```
+1 - 0.99^20 = 18%
+```
+
+Roughly one in five page loads hits your p99, not one in a hundred. Our dashboard page made 23 calls. Users weren't unlucky; they were doing arithmetic we hadn't.
+
+This is why p99 matters more than p50 as a system grows, and why "only 1% of requests are slow" is a much weaker statement than it sounds. Fan-out multiplies tail latency into typical experience.
+
+## What I put on dashboards now
+
+- **Histograms, aggregated at query time.** Never a pre-computed percentile per host.
+- **Queue time and service time as separate series.** On the same graph, since the shape of the divergence tells you which problem you have.
+- **p50, p95, p99, and max.** p50 for whether the common path is healthy, p99 for what an unlucky user gets, max because it's the only one that shows you the single 40-second request that nothing else surfaces.
+- **Per-endpoint, not global.** A global p99 is dominated by whichever endpoint has the most traffic, so a genuinely broken but rarely-hit report generator never appears.
+- **Client-side timing too.** `PerformanceObserver` for real user monitoring, because everything above still stops at your load balancer. TLS negotiation, DNS, and a user's ADSL line are all part of the eleven seconds and none of it is in your server metrics.
+
+## The thing I'd tell anyone building a dashboard
+
+Write down what question each graph answers before you add it. Not what it shows — what you'd *do* differently based on it.
+
+"Mean of per-container p99" survived a year on our main dashboard because it looked like a number that meant something. Nobody had ever asked what decision it would inform, and if we had, we'd have noticed within a minute that it couldn't inform any, because it isn't a measurement of anything that exists.

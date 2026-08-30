@@ -1,0 +1,146 @@
+We scaled from one container to four on a Tuesday afternoon. On Wednesday morning, 3,100 customers each received four copies of the same digest email.
+
+The maths is not subtle in hindsight. The scheduler was part of the application process, the application ran in four containers, and so there were four schedulers, each firing at 06:00 with no knowledge of the other three.
+
+This is the problem nobody warns you about when you go from one replica to many, because with one replica the design is invisible. It isn't a bug you introduced. It's an assumption that stopped being true.
+
+## The shape of the problem
+
+Almost everything in a web app is *per-request* work, and per-request work parallelises across containers beautifully — that's the entire point of running several. Scheduled work is the opposite. It's **singleton work**: it must happen once per interval across the whole fleet, not once per interval per process.
+
+Container orchestrators are very good at "keep N copies of this running" and structurally unhelpful at "run this exactly once", because exactly-once is not something a distributed system can promise you. So the job is to get as close as the failure modes allow, and then make the work tolerate the gap.
+
+There are three approaches I've used. They're not equivalent.
+
+## Approach 1: a dedicated scheduler container
+
+Run the clock as its own service, scaled to exactly one.
+
+```yaml
+services:
+  web:
+    command: bundle exec puma
+    deploy: { replicas: 4 }
+
+  worker:
+    command: bundle exec sidekiq
+    deploy: { replicas: 3 }
+
+  scheduler:
+    command: bundle exec clockwork config/clock.rb
+    deploy: { replicas: 1 }   # the whole design is this line
+```
+
+The scheduler enqueues jobs; the workers execute them. It's clean, it's obvious to a new engineer, and the constraint lives in the deployment config where someone changing replica counts will see it.
+
+The failure mode is that "replicas: 1" means *at most* one and also *at least* one, and orchestrators care much more about the ceiling than the floor. During a rolling deploy you can briefly have zero schedulers, or two — the old one hasn't got its `SIGTERM` yet and the new one is already ticking. If your window is a 06:00 daily digest, a thirty-second overlap almost never matters. If you're firing something every ten seconds, it matters constantly.
+
+## Approach 2: a distributed lock
+
+Let every container run a scheduler, and make them race for permission. Whoever gets the lock does the work; everyone else shrugs and moves on.
+
+If you're already on Postgres, advisory locks are the least infrastructure you can add. They're held by a session or a transaction rather than attached to a row, so there's no sentinel table to create and nothing to clean up if a process dies.
+
+```ruby
+module SingletonTask
+  # Arbitrary namespace so these locks can't collide with anything else.
+  NAMESPACE = 0x5f3a
+
+  # Runs the block on exactly one caller. Returns :skipped on the others.
+  def self.once(name)
+    key = Zlib.crc32(name)
+
+    ActiveRecord::Base.transaction do
+      acquired = ActiveRecord::Base.connection.exec_query(
+        "SELECT pg_try_advisory_xact_lock($1, $2) AS locked",
+        "advisory_lock",
+        [NAMESPACE, key]
+      ).first["locked"]
+
+      next :skipped unless acquired
+
+      yield
+      :ran
+    end
+  end
+end
+
+SingletonTask.once("daily_digest") { DailyDigestJob.perform_async }
+```
+
+Three details in there that took me a while to get right.
+
+It's `pg_try_advisory_xact_lock`, not `pg_advisory_lock`. The `try` variant returns false immediately instead of blocking — you want the losers to leave, not to queue up and run the job one after another. And the `xact` variant releases when the transaction ends, including if the process is killed mid-work, so a crashed container can't hold the lock forever. The non-transactional version needs an explicit unlock and will strand the lock if you skip it.
+
+The block must be short. This pattern is for *deciding* who enqueues, not for doing the work — you don't want a database transaction open for the duration of a report.
+
+Redis works equally well if that's what you have, via `SET key value NX EX 60`. The tradeoff is that a Redis lock has a TTL rather than a session lifetime, so you're guessing how long the work takes. Guess short and two containers run it; guess long and a crash blocks the next several intervals. Postgres tying the lock to the transaction sidesteps that guess entirely, which is why I reach for it first.
+
+If you're on Sidekiq, `sidekiq-cron` does essentially this for you, with the schedule in Redis and the leadership handled internally. Reaching for that is usually the right call over hand-rolling — I've written the above mostly in codebases that weren't using Sidekiq for scheduling yet.
+
+## Approach 3: let the orchestrator schedule it
+
+Kubernetes has `CronJob`, ECS has scheduled tasks. The platform starts a container, it runs, it exits.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-digest
+spec:
+  schedule: "0 6 * * *"
+  concurrencyPolicy: Forbid      # don't start if the last run is still going
+  startingDeadlineSeconds: 300   # give up rather than firing late
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: digest
+              image: app:1.42.0
+              command: ["bundle", "exec", "rails", "digest:send"]
+```
+
+This is my default now for anything daily or hourly. The schedule is declarative, it's visible to whoever is on call, and it doesn't consume a long-lived process just to watch a clock.
+
+`concurrencyPolicy: Forbid` is the flag people miss. Without it, a job that takes 70 minutes on an hourly schedule will happily overlap with itself, and you're back to the duplicate problem by a different route.
+
+But read the Kubernetes documentation on `CronJob` carefully, because it says the quiet part out loud: it's "approximately once". If the controller is down across your scheduled time you get a missed run, and under certain conditions you get two. Which brings us to the thing that actually mattered.
+
+## The lock is not the fix
+
+I spent a day on advisory locks and shipped them and felt good, and I was still one bad node eviction away from four emails again.
+
+Every mechanism above reduces the *probability* of a double run. None of them eliminate it, because "exactly once" across independent machines with unreliable networks isn't available at any price. What's available is at-least-once delivery plus work that doesn't care.
+
+```ruby
+class DailyDigestJob
+  include Sidekiq::Job
+
+  def perform(date = Date.current.to_s)
+    # The unique index on (kind, period) is what actually enforces this.
+    DigestRun.create!(kind: "daily", period: date)
+  rescue ActiveRecord::RecordNotUnique
+    logger.info("daily digest for #{date} already ran")
+  else
+    User.subscribed.find_each { |user| DigestMailer.daily(user, date).deliver_later }
+  end
+end
+```
+
+The unique index is the only part of this system that can genuinely arbitrate whether today's digest has been sent, because it's the only part with a single source of truth. Note the job takes the date as a parameter rather than reading the clock — that makes it re-runnable for a specific day, which you will want at 09:00 on the morning the 06:00 run failed.
+
+Scheduling decides *when* work is attempted, and it's a best-effort hint. Idempotency decides whether attempting it twice is a problem. If you only have budget for one of them, make the work idempotent — a job that's safe to run twice turns a scheduling bug into a log line, whereas perfect scheduling with unsafe work just means you haven't been unlucky yet.
+
+## What I'd check on any multi-container app
+
+Go through everything that runs on a timer and ask which of these it is:
+
+- **Enqueued by a scheduler you deploy** — is that service pinned to one replica, and does anything stop someone bumping it?
+- **Enqueued by the app process itself** — this is the bug. It scales with your replica count.
+- **Scheduled by the platform** — is `concurrencyPolicy` set, and does a missed run matter?
+
+Then, separately and more importantly: for each one, what happens if it runs twice in the same window? If the answer isn't "nothing", that's the thing to fix first, whatever the scheduling story is.

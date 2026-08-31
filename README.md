@@ -183,6 +183,27 @@ requires a per-request nonce from middleware, which would opt the entire site
 out of static rendering. Everything remains origin-locked, so no third-party
 script or style host can be loaded.
 
+## Analytics
+
+`<Analytics />` from `@vercel/analytics` is mounted in the root layout. It's
+cookieless and collects no personally identifying information.
+
+Its interaction with the CSP is worth knowing, because it differs by
+environment:
+
+- **Production on Vercel** — the script is served from
+  `/_vercel/insights/script.js` and events post to `/_vercel/insights/event`.
+  Both are first-party, so `'self'` already covers them and the strict CSP needs
+  no exception. This is also why ad blockers don't break it.
+- **Development** — the package loads a debug build from
+  `va.vercel-scripts.com`, which is cross-origin. `next.config.ts` allows that
+  host in `script-src` and `connect-src` **in development only**.
+
+Running a production build locally (`npm run build && npm start`) will log a 404
+for `/_vercel/insights/script.js`. That's expected: the route is injected by
+Vercel's edge at deploy time and doesn't exist off-platform. It isn't a CSP
+failure, and it disappears once deployed.
+
 ## Deploying
 
 Every route prerenders to static output, so any Node host or edge platform

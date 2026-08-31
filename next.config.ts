@@ -15,14 +15,21 @@ const isDev = process.env.NODE_ENV !== "production";
  * Development additionally needs 'unsafe-eval' (React's dev build uses eval for
  * debugging features), websockets for hot reload, and no HTTPS upgrade so that
  * http://localhost keeps working. None of those relaxations ship to production.
+ *
+ * Vercel Analytics needs no allowance in production: it serves its script from
+ * /_vercel/insights/script.js and beacons to /_vercel/insights/event, both
+ * first-party, so 'self' already covers them. Only the development build pulls
+ * a debug script from va.vercel-scripts.com.
  */
+const VERCEL_ANALYTICS_DEV_HOST = "https://va.vercel-scripts.com";
+
 const contentSecurityPolicy = [
   "default-src 'self'",
-  `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
+  `script-src 'self' 'unsafe-inline'${isDev ? ` 'unsafe-eval' ${VERCEL_ANALYTICS_DEV_HOST}` : ""}`,
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  `connect-src 'self'${isDev ? " ws: wss:" : ""}`,
+  `connect-src 'self'${isDev ? ` ws: wss: ${VERCEL_ANALYTICS_DEV_HOST}` : ""}`,
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "object-src 'none'",
